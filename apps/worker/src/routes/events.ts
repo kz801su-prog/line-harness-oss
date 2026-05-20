@@ -653,8 +653,6 @@ events.post('/api/liff/events/me/:bookingId/cancel', async (c) => {
     .bind(callerLineUserId, account_id)
     .first<{ id: string }>();
   if (!friend) return bad(c, 'friend_not_found', 404);
-  const bookingFriend = friend;
-  const bookingLineUserId = callerLineUserId;
 
   const row = await c.env.DB
     .prepare(

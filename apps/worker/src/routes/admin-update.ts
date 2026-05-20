@@ -43,7 +43,6 @@ import {
   type D1Like,
   type ReleaseEntry,
   type CurrentVersion,
-  type UpdateHandle,
 } from '@line-harness/update-engine';
 import {
   BUNDLE_VERSION,
@@ -133,7 +132,7 @@ app.post('/start', async (c) => {
   // The manifest always pins one "latest" version; locate that entry. If the
   // manifest is malformed (latest doesn't appear in releases[]) we fail
   // closed rather than guess.
-  const target = manifest.releases.find((r: ReleaseEntry) => r.version === manifest.latest);
+  const target = manifest.releases.find((r) => r.version === manifest.latest);
   if (!target) {
     return c.json({ error: 'manifest_missing_target' }, 500);
   }
@@ -182,7 +181,7 @@ app.post('/start', async (c) => {
   // update never started. Phase failures (preflight/apply/verify) do
   // NOT throw here; they land in the snapshot row and are observable
   // via `/status/:id` and `/stream/:id`.
-  let handle: UpdateHandle;
+  let handle;
   try {
     handle = await runUpdate({
       ctx: {
@@ -237,7 +236,7 @@ app.get('/status/:id', async (c) => {
     .trim()
     .split('\n')
     .filter(Boolean)
-    .map((line: string) => {
+    .map((line) => {
       try {
         return JSON.parse(line);
       } catch {

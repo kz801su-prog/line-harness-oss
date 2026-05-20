@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.14.1 (2026-05-20)
+
+### Bug Fixes
+- Synced the latest private worker updates into the OSS branch while preserving the OSS CI baseline.
+- Tightened the admin update route typing without changing runtime behavior.
+- Removed unused LIFF event booking aliases after the idempotency flow was stabilized.
+
+### Verification
+- `pnpm --filter worker typecheck`
+- `pnpm --filter worker test`
+- `pnpm --filter worker build`
+
 ## v0.2.0 (2026-03-25)
 
 ### Breaking Changes
