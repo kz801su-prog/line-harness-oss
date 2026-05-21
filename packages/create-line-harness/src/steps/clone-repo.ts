@@ -9,6 +9,7 @@ import {
   resolveInstalledWranglerConfig,
   type SavedInstallConfig,
 } from "../lib/installed-wrangler.js";
+import { repoPnpm } from "../lib/pnpm.js";
 
 const REPO_URL =
   process.env.LINE_HARNESS_REPO_URL ??
@@ -103,12 +104,12 @@ export async function ensureRepo(repoDir: string | null): Promise<string> {
   // Install dependencies
   s.start("依存関係インストール中...");
   try {
-    await execa("npx", ["pnpm", "install", "--frozen-lockfile"], {
+    await repoPnpm(homeDir, ["install", "--frozen-lockfile"], {
       cwd: homeDir,
     });
   } catch {
     // Try without frozen lockfile
-    await execa("npx", ["pnpm", "install"], { cwd: homeDir });
+    await repoPnpm(homeDir, ["install"], { cwd: homeDir });
   }
   s.stop("依存関係インストール完了");
 

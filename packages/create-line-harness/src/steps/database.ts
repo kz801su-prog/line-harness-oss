@@ -1,11 +1,16 @@
 import * as p from "@clack/prompts";
-import { readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { wrangler, WranglerError } from "../lib/wrangler.js";
 
 interface DatabaseResult {
   databaseId: string;
   databaseName: string;
+}
+
+interface BootstrapMeta {
+  includedMigrations: string[];
+  migrationCount: number;
 }
 
 const TRANSIENT_D1_ERROR = /code[:\s]*10043|cloudflarestatus|temporarily unavailable|internal error|timed out|timeout|fetch failed|network|connection reset/i;
@@ -43,6 +48,54 @@ async function runD1WithRetry(
   throw lastErr;
 }
 
+const isBenignSchemaError = (err: unknown): boolean => {
+  if (!(err instanceof WranglerError)) return false;
+  const text = `${err.message}\n${err.stderr}`.toLowerCase();
+  return (
+    text.includes("duplicate column") ||
+    text.includes("already exists") ||
+    text.includes("table") && text.includes("already")
+  );
+};
+
+async function verifyLatestSchema(databaseName: string): Promise<void> {
+  const verify = await runD1WithRetry(
+    [
+      "d1",
+      "execute",
+      databaseName,
+      "--remote",
+      "--command",
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='line_accounts'",
+    ],
+    "テーブル検証",
+  );
+
+  if (!verify.includes("line_accounts")) {
+    throw new Error(
+      "schema/bootstrap を適用したのに line_accounts テーブルが見当たりません。`packages/db/bootstrap.sql` または migration 適用に問題があります。",
+    );
+  }
+}
+
+function loadBootstrapMeta(repoDir: string): BootstrapMeta | null {
+  const metaPath = join(repoDir, "packages/db/bootstrap-meta.json");
+  if (!existsSync(metaPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(metaPath, "utf8")) as BootstrapMeta;
+    if (
+      typeof parsed.migrationCount !== "number" ||
+      !Array.isArray(parsed.includedMigrations) ||
+      !parsed.includedMigrations.every((value) => typeof value === "string")
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export async function createDatabase(
   repoDir: string,
   databaseName: string,
@@ -53,6 +106,7 @@ export async function createDatabase(
   // detect the "already exists" case via captured stderr.
   s.start("D1 データベース作成中...");
   let databaseId: string;
+  let createdNow = false;
   try {
     const output = await runD1WithRetry(
       ["d1", "create", databaseName],
@@ -69,6 +123,7 @@ export async function createDatabase(
       throw new Error(`D1 ID をパースできません: ${output}`);
     }
     databaseId = match[1];
+    createdNow = true;
     s.stop("D1 データベース作成完了");
   } catch (error) {
     if (
@@ -94,56 +149,29 @@ export async function createDatabase(
     }
   }
 
-  // Run base schema first, then migrations
+  const bootstrapFile = join(repoDir, "packages/db/bootstrap.sql");
   const schemaFile = join(repoDir, "packages/db/schema.sql");
   const migrationsDir = join(repoDir, "packages/db/migrations");
   const migrationFiles = readdirSync(migrationsDir)
     .filter((f) => f.endsWith(".sql"))
     .sort();
+  const bootstrapMeta = loadBootstrapMeta(repoDir);
+  const includedMigrations = new Set(bootstrapMeta?.includedMigrations ?? []);
+  const canUseBootstrap =
+    createdNow &&
+    existsSync(bootstrapFile) &&
+    bootstrapMeta !== null &&
+    bootstrapMeta.includedMigrations.every((file) => migrationFiles.includes(file));
 
-  const totalFiles = 1 + migrationFiles.length;
-  s.start(`テーブル作成中（${totalFiles} files）...`);
-
-  // A wrangler error is benign only if it indicates the table/column already
-  // exists (i.e. this migration has been applied before). Anything else —
-  // including the API never being reached — is a real failure that must
-  // surface so the user doesn't end up with an empty database thinking
-  // setup succeeded (issue: 'no such table: line_accounts' on Step 12).
-  const isBenignSchemaError = (err: unknown): boolean => {
-    if (!(err instanceof WranglerError)) return false;
-    const text = `${err.message}\n${err.stderr}`.toLowerCase();
-    return (
-      text.includes("duplicate column") ||
-      text.includes("already exists") ||
-      text.includes("table") && text.includes("already") // catch "table foo already exists"
+  if (canUseBootstrap) {
+    const pendingMigrations = migrationFiles.filter(
+      (file) => !includedMigrations.has(file),
     );
-  };
-
-  // Base schema (CREATE IF NOT EXISTS for everything in schema.sql — failing
-  // here is fatal because subsequent steps assume the core tables exist).
-  try {
-    await runD1WithRetry(
-      [
-        "d1",
-        "execute",
-        databaseName,
-        "--remote",
-        "--file",
-        schemaFile,
-      ],
-      "ベーススキーマ適用",
-    );
-  } catch (err) {
-    if (!isBenignSchemaError(err)) {
-      s.stop("ベーススキーマ適用に失敗");
-      throw err;
-    }
-  }
-
-  // Migration files — duplicate-column / already-exists are expected on
-  // re-runs and resumed installs, but any other error means the migration
-  // never ran and we should bail rather than silently advance.
-  for (const file of migrationFiles) {
+    const label =
+      pendingMigrations.length === 0
+        ? "テーブル作成中（bootstrap）..."
+        : `テーブル作成中（bootstrap + ${pendingMigrations.length} migrations）...`;
+    s.start(label);
     try {
       await runD1WithRetry(
         [
@@ -152,44 +180,86 @@ export async function createDatabase(
           databaseName,
           "--remote",
           "--file",
-          join(migrationsDir, file),
+          bootstrapFile,
         ],
-        `migration 適用: ${file}`,
+        "bootstrap 適用",
       );
     } catch (err) {
       if (!isBenignSchemaError(err)) {
-        s.stop(`migration 失敗: ${file}`);
+        s.stop("bootstrap 適用に失敗");
         throw err;
+      }
+    }
+
+    for (const file of pendingMigrations) {
+      try {
+        await runD1WithRetry(
+          [
+            "d1",
+            "execute",
+            databaseName,
+            "--remote",
+            "--file",
+            join(migrationsDir, file),
+          ],
+          `bootstrap 後 migration 適用: ${file}`,
+        );
+      } catch (err) {
+        if (!isBenignSchemaError(err)) {
+          s.stop(`migration 失敗: ${file}`);
+          throw err;
+        }
+      }
+    }
+  } else {
+    const totalFiles = 1 + migrationFiles.length;
+    s.start(`テーブル作成中（${totalFiles} files）...`);
+
+    try {
+      await runD1WithRetry(
+        [
+          "d1",
+          "execute",
+          databaseName,
+          "--remote",
+          "--file",
+          schemaFile,
+        ],
+        "ベーススキーマ適用",
+      );
+    } catch (err) {
+      if (!isBenignSchemaError(err)) {
+        s.stop("ベーススキーマ適用に失敗");
+        throw err;
+      }
+    }
+
+    for (const file of migrationFiles) {
+      try {
+        await runD1WithRetry(
+          [
+            "d1",
+            "execute",
+            databaseName,
+            "--remote",
+            "--file",
+            join(migrationsDir, file),
+          ],
+          `migration 適用: ${file}`,
+        );
+      } catch (err) {
+        if (!isBenignSchemaError(err)) {
+          s.stop(`migration 失敗: ${file}`);
+          throw err;
+        }
       }
     }
   }
 
-  // Final guard: confirm the core table exists. Catches the silent-failure
-  // mode where every wrangler call was rejected (e.g. wrangler.toml had a
-  // placeholder account_id and every API call 404'd) and the user would
-  // otherwise hit `no such table: line_accounts` two steps later.
   try {
-    const verify = await runD1WithRetry(
-      [
-        "d1",
-        "execute",
-        databaseName,
-        "--remote",
-        "--command",
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='line_accounts'",
-      ],
-      "テーブル検証",
-    );
-    if (!verify.includes("line_accounts")) {
-      s.stop("テーブル検証失敗");
-      throw new Error(
-        "schema/migration を適用したのに line_accounts テーブルが見当たりません。手動で `npx wrangler d1 execute " +
-          databaseName +
-          " --remote --file packages/db/schema.sql` を実行してください。",
-      );
-    }
+    await verifyLatestSchema(databaseName);
   } catch (err) {
-    s.stop("テーブル検証失敗");
+      s.stop("テーブル検証失敗");
     throw err;
   }
 

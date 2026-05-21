@@ -7,10 +7,13 @@
   "types": "./src/index.ts",
   "files": [
     "src",
+    "bootstrap-meta.json",
+    "bootstrap.sql",
     "schema.sql",
     "migrations"
   ],
   "scripts": {
+    "generate:bootstrap": "node ./scripts/generate-bootstrap.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

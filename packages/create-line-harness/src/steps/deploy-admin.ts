@@ -1,8 +1,8 @@
 import * as p from "@clack/prompts";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { execa } from "execa";
 import { wrangler, WranglerError } from "../lib/wrangler.js";
+import { repoPnpm } from "../lib/pnpm.js";
 
 const TTY_REQUIRED =
   /non[- ]?interactive|cloudflare_api_token|consent denied|authentication error|expired/i;
@@ -32,7 +32,7 @@ export async function deployAdmin(
 
   // Build Next.js
   try {
-    await execa("npx", ["pnpm", "run", "build"], { cwd: webDir });
+    await repoPnpm(options.repoDir, ["run", "build"], { cwd: webDir });
   } catch (error: any) {
     buildSpinner.stop("Admin UI ビルド失敗");
     throw new Error(`Admin UI のビルドに失敗しました: ${error.message}`);

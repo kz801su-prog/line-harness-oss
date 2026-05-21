@@ -7,6 +7,7 @@ import {
   renderInstalledWranglerToml,
   type InstalledWranglerConfig,
 } from "../lib/installed-wrangler.js";
+import { repoPnpm } from "../lib/pnpm.js";
 
 const WORKERS_DEV_URL = /(https:\/\/[^\s]+\.workers\.dev)/;
 const TTY_REQUIRED = /non[- ]?interactive|cloudflare_api_token|consent denied|authentication error|expired/i;
@@ -164,10 +165,9 @@ crons = ["*/5 * * * *"]
   buildSpinner.start("Worker ビルド中...");
   try {
     // Build workspace dependencies that the worker needs
-    await execa(
-      "npx",
+    await repoPnpm(
+      options.repoDir,
       [
-        "pnpm",
         "-r",
         "--filter",
         "./packages/shared",
