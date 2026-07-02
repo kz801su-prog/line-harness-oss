@@ -1,0 +1,8 @@
+# config.php を外部から直接アクセス禁止にする
+<Files "config.php">
+  Order Allow,Deny
+  Deny from all
+</Files>
+
+# PHP文字コードをUTF-8に統一
+AddDefaultCharset utf-8

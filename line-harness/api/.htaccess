@@ -1,0 +1,2 @@
+# API ディレクトリ: ブラウザ直接アクセスを禁止し、POSTのみ許可
+Options -Indexes
