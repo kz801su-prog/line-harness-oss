@@ -7,9 +7,9 @@
 // ── MySQL ────────────────────────────────────────────────────
 define('DB_HOST',    'localhost');
 define('DB_PORT',    3306);
-define('DB_USER',    'YOUR_MYSQL_USER');      // 例: kz801xs_boss
-define('DB_PASS',    'YOUR_MYSQL_PASSWORD');
-define('DB_NAME',    'YOUR_DATABASE_NAME');   // 例: kz801xs_boss_db
+define('DB_USER',    'kz801xs_692');      // 例: kz801xs_boss
+define('DB_PASS',    'NA58wngrLfVHtK');
+define('DB_NAME',    'kz801xs_line');    // 例: kz801xs_boss_db
 define('DB_CHARSET', 'utf8mb4');
 
 // ── LINE Messaging API ────────────────────────────────────────

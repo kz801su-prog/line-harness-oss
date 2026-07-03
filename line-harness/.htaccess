@@ -1,17 +1,10 @@
-# LINE Harness セキュリティ設定
 Options -Indexes
+AddDefaultCharset utf-8
 
-# config.php を直接アクセス禁止
 <Files "config.php">
-  Order Allow,Deny
-  Deny from all
+  Require all denied
 </Files>
 
-# PHP文字コードをUTF-8に強制
-AddDefaultCharset utf-8
-php_value default_charset utf-8
-
-# セキュリティヘッダー
 <IfModule mod_headers.c>
   Header always set X-Content-Type-Options "nosniff"
   Header always set X-Frame-Options "SAMEORIGIN"

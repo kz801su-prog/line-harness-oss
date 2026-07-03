@@ -579,7 +579,9 @@ body {
 
   <div class="nav-links">
     <span class="nav-link-btn active"><i class="bi bi-grid-1x2"></i> ダッシュボード</span>
-    <a href="./keyword_settings.php" class="nav-link-btn"><i class="bi bi-tags"></i> キーワード設定</a>
+    <a href="./post_editor.php" class="nav-link-btn"><i class="bi bi-pencil-square"></i> 投稿作成</a>
+    <a href="./ai_settings.php" class="nav-link-btn"><i class="bi bi-cpu"></i> AI設定</a>
+    <a href="./keyword_settings.php" class="nav-link-btn"><i class="bi bi-tags"></i> キーワード</a>
   </div>
 
   <div class="nav-right">

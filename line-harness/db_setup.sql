@@ -70,3 +70,26 @@ INSERT IGNORE INTO `keyword_patterns` (keyword, asset_url, category) VALUES
 ('ジャケット', 'https://boss-store.com/assets/media/fabric_closeup.jpg',       'apparel'),
 ('ゴルフ',     'https://boss-store.com/assets/media/golf_course_sunset.jpg',   'golf'),
 ('職人',       'https://boss-store.com/assets/media/craftsman_workshop.jpg',   'brand');
+
+-- ⑤ システム設定テーブル（AI設定・スケジュール設定を保存）
+CREATE TABLE IF NOT EXISTS `system_settings` (
+    `key`        VARCHAR(100) NOT NULL,
+    `value`      TEXT         DEFAULT NULL,
+    `updated_at` DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- デフォルト設定
+INSERT IGNORE INTO `system_settings` (`key`, `value`) VALUES
+('ai_provider',       'openai'),
+('ai_model',          'gpt-4o'),
+('ai_api_key',        ''),
+('ai_system_prompt',  ''),
+('ai_temperature',    '0.7'),
+('ai_max_tokens',     '300'),
+('post_topic',        ''),
+('post_style',        '親しみやすく、商品の魅力を伝える'),
+('post_hashtags',     ''),
+('schedule_enabled',  '0'),
+('schedule_hours',    '10,18'),
+('schedule_days',     '1,2,3,4,5');
