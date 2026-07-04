@@ -4,6 +4,7 @@ mb_internal_encoding('UTF-8');
 header('Content-Type: text/html; charset=utf-8');
 session_start();
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/lib/ai_post_assist.php';
 
 function db(): PDO {
     static $pdo = null;
@@ -12,6 +13,57 @@ function db(): PDO {
         $pdo = new PDO($dsn, DB_USER, DB_PASS, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
     }
     return $pdo;
+}
+
+/**
+ * Purpose: AI設定画面の通常保存と承認即保存が同じ保存処理を使うための共通化。
+ * Connected to: ./ai_settings.php?api=save と ./ai_settings.php?api=approve_style の両API。
+ */
+function save_settings_payload(array $raw): void {
+    $allowed = ['ai_provider','ai_model','ai_api_key','ai_api_key_openai','ai_api_key_anthropic','ai_api_key_gemini','ai_system_prompt','ai_temperature',
+                'ai_max_tokens','post_topic','post_style','post_hashtags',
+                'schedule_enabled','schedule_hours','schedule_days'];
+    $st = db()->prepare("INSERT INTO system_settings (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)");
+    foreach ($allowed as $k) {
+        if (!array_key_exists($k, $raw)) continue;
+        if (in_array($k, ['ai_api_key','ai_api_key_openai','ai_api_key_anthropic','ai_api_key_gemini'], true) && $raw[$k] === '') continue;
+        $st->execute([$k, $raw[$k]]);
+    }
+}
+
+/**
+ * Purpose: 選択されたAIプロバイダーに対応する保存済みAPIキーを解決する。
+ * Connected to: 接続テスト、スタイルサジェスト、投稿作成側の設定読込と同じ保存規約。
+ */
+function get_saved_provider_api_key(string $provider): string {
+    $keyName = provider_api_setting_key($provider);
+    $value = db()->prepare("SELECT `value` FROM system_settings WHERE `key`=?");
+    $value->execute([$keyName]);
+    $resolved = (string)($value->fetchColumn() ?: '');
+    if ($resolved !== '') {
+        return $resolved;
+    }
+    $legacy = db()->query("SELECT `value` FROM system_settings WHERE `key`='ai_api_key'")->fetchColumn() ?: '';
+    return (string)$legacy;
+}
+
+/**
+ * Purpose: 画面初期表示で各AIの登録状況を見せ、プロバイダー切替時に正しい状態を表示する。
+ * Connected to: ai_settings.php の loadSettings() と selectProvider()。
+ *
+ * @return array<string,string>
+ */
+function build_api_key_masks(array $settings): array {
+    $masks = [];
+    foreach (['openai', 'anthropic', 'gemini'] as $provider) {
+        $keyName = provider_api_setting_key($provider);
+        $raw = (string)($settings[$keyName] ?? '');
+        if ($raw === '' && isset($settings['ai_provider'], $settings['ai_api_key']) && $settings['ai_provider'] === $provider) {
+            $raw = (string)$settings['ai_api_key'];
+        }
+        $masks[$provider] = $raw !== '' ? substr($raw, 0, 6) . '*****' : '';
+    }
+    return $masks;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_pass'])) {
@@ -31,8 +83,8 @@ if ($auth && isset($_GET['api'])) {
             $rows = db()->query("SELECT `key`, `value` FROM system_settings")->fetchAll();
             $s = [];
             foreach ($rows as $r) $s[$r['key']] = $r['value'];
-            // APIキーはマスク
-            if (!empty($s['ai_api_key'])) $s['ai_api_key_masked'] = substr($s['ai_api_key'],0,6).'*****';
+            // APIキーは provider 切替時に正しく見せるため、各AIごとにマスクして返す。
+            $s['ai_api_key_masks'] = build_api_key_masks($s);
             echo json_encode(['ok'=>true,'data'=>$s], JSON_UNESCAPED_UNICODE);
         } catch(Exception $e) { echo json_encode(['ok'=>false,'message'=>$e->getMessage()],JSON_UNESCAPED_UNICODE); }
         exit;
@@ -41,17 +93,13 @@ if ($auth && isset($_GET['api'])) {
     // 設定保存
     if ($_GET['api'] === 'save' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $raw = json_decode(file_get_contents('php://input'), true) ?? [];
-        $allowed = ['ai_provider','ai_model','ai_api_key','ai_system_prompt','ai_temperature',
-                    'ai_max_tokens','post_topic','post_style','post_hashtags',
-                    'schedule_enabled','schedule_hours','schedule_days'];
         try {
-            $st = db()->prepare("INSERT INTO system_settings (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)");
-            foreach ($allowed as $k) {
-                if (!array_key_exists($k, $raw)) continue;
-                // APIキーが空なら既存を保持
-                if ($k === 'ai_api_key' && $raw[$k] === '') continue;
-                $st->execute([$k, $raw[$k]]);
+            $provider = (string)($raw['ai_provider'] ?? 'openai');
+            $providerKeyName = provider_api_setting_key($provider);
+            if (array_key_exists('ai_api_key', $raw) && $raw['ai_api_key'] !== '') {
+                $raw[$providerKeyName] = $raw['ai_api_key'];
             }
+            save_settings_payload($raw);
             echo json_encode(['ok'=>true,'message'=>'設定を保存しました'],JSON_UNESCAPED_UNICODE);
         } catch(Exception $e) { echo json_encode(['ok'=>false,'message'=>$e->getMessage()],JSON_UNESCAPED_UNICODE); }
         exit;
@@ -64,12 +112,55 @@ if ($auth && isset($_GET['api'])) {
         $model    = $raw['model']    ?? 'gpt-4o';
         // APIキーが送られていない場合はDBから取得
         $apiKey = (!empty($raw['api_key']) && $raw['api_key'] !== '') ? $raw['api_key']
-                : (db()->query("SELECT `value` FROM system_settings WHERE `key`='ai_api_key'")->fetchColumn() ?: '');
+                : get_saved_provider_api_key($provider);
         if (!$apiKey) { echo json_encode(['ok'=>false,'message'=>'APIキーが未設定です'],JSON_UNESCAPED_UNICODE); exit; }
 
         $testPrompt = 'テスト接続です。「接続成功」と日本語で1文だけ返答してください。';
         $result = call_ai($provider, $model, $apiKey, 'あなたはアシスタントです。', $testPrompt, 0.1, 50);
         echo json_encode($result, JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    // 投稿スタイル設定の候補を AI から取得し、UI に仮反映するための API。
+    if ($_GET['api'] === 'suggest_style' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $raw = json_decode(file_get_contents('php://input'), true) ?? [];
+        $provider = $raw['provider'] ?? 'openai';
+        $model = $raw['model'] ?? 'gpt-4o';
+        $apiKey = (!empty($raw['api_key']) && $raw['api_key'] !== '') ? $raw['api_key']
+            : get_saved_provider_api_key($provider);
+        if (!$apiKey) { echo json_encode(['ok'=>false,'message'=>'APIキーが未設定です'],JSON_UNESCAPED_UNICODE); exit; }
+
+        $prompt = build_style_suggestion_prompt([
+            'topic' => $raw['post_topic'] ?? '',
+            'current_style' => $raw['post_style'] ?? '',
+            'hashtags' => $raw['post_hashtags'] ?? '',
+            'system_prompt' => $raw['ai_system_prompt'] ?? '',
+            'mode' => $raw['mode'] ?? 'preview',
+        ]);
+        $result = call_ai($provider, $model, $apiKey, 'あなたはLINE投稿設計の専門家です。JSONのみを返してください。', $prompt, (float)($raw['temperature'] ?? 0.7), (int)($raw['max_tokens'] ?? 500));
+        if (!$result['ok']) {
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $suggestion = normalize_style_suggestion_payload((string)$result['text']);
+        echo json_encode(['ok'=>true, 'data'=>$suggestion], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    // 投稿スタイル設定の候補を承認と同時に保存し、ハンズフリー運用を支える API。
+    if ($_GET['api'] === 'approve_style' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $raw = json_decode(file_get_contents('php://input'), true) ?? [];
+        try {
+            $provider = (string)($raw['ai_provider'] ?? 'openai');
+            $providerKeyName = provider_api_setting_key($provider);
+            if (array_key_exists('ai_api_key', $raw) && $raw['ai_api_key'] !== '') {
+                $raw[$providerKeyName] = $raw['ai_api_key'];
+            }
+            save_settings_payload($raw);
+            echo json_encode(['ok'=>true,'message'=>'AI候補を承認して保存しました'],JSON_UNESCAPED_UNICODE);
+        } catch(Exception $e) {
+            echo json_encode(['ok'=>false,'message'=>$e->getMessage()],JSON_UNESCAPED_UNICODE);
+        }
         exit;
     }
 
@@ -183,6 +274,12 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
 .toast-wrap{position:fixed;bottom:1.5rem;right:1.5rem;z-index:9999;display:flex;flex-direction:column;gap:8px;}
 .toast-item{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:.8rem 1.2rem;font-size:.83rem;min-width:240px;max-width:360px;display:flex;align-items:center;gap:10px;box-shadow:0 8px 24px rgba(0,0,0,.5);animation:slideIn .25s ease;}
 .toast-ok{border-left:3px solid var(--success);}.toast-err{border-left:3px solid var(--danger);}
+.suggestion-box{display:none;margin-top:1rem;padding:1rem;border:1px solid rgba(59,130,246,.35);border-radius:10px;background:rgba(59,130,246,.08);}
+.suggestion-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem;}
+@media(max-width:640px){.suggestion-grid{grid-template-columns:1fr;}}
+.suggestion-card{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:.8rem;}
+.suggestion-title{font-size:.74rem;color:var(--text3);margin-bottom:.35rem;}
+.suggestion-value{font-size:.82rem;color:var(--text);white-space:pre-wrap;line-height:1.6;}
 @keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
 .spinner{animation:spin 1s linear infinite;display:inline-block;}@keyframes spin{to{transform:rotate(360deg)}}
 .login-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at top,#0a1628,#080d16 60%);}
@@ -278,6 +375,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
         <div class="field-hint" id="apikey-hint">
           OpenAI: <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com/api-keys</a>
         </div>
+        <div class="field-hint">選択中のAIごとに別々のキーとして保存されます。切り替えて入力すれば複数登録できます。</div>
         <div style="margin-top:.5rem;font-size:.75rem;color:var(--text3)" id="apikey-stored"></div>
       </div>
 
@@ -300,7 +398,12 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
       </div>
       <div class="form-field">
         <label class="field-label"><i class="bi bi-palette"></i> 文体・トーン</label>
-        <input type="text" id="f-style" class="field-input" placeholder="例: 親しみやすく、商品の魅力を伝える">
+        <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+          <input type="text" id="f-style" class="field-input" placeholder="例: 親しみやすく、商品の魅力を伝える" style="flex:1 1 280px">
+          <button class="btn-secondary" type="button" onclick="suggestStyle(false)"><i class="bi bi-magic"></i> AIサジェスト</button>
+          <button class="btn-primary" type="button" onclick="suggestStyle(true)" style="padding:.6rem 1rem"><i class="bi bi-lightning-charge"></i> AIに任せて作成</button>
+        </div>
+        <div class="field-hint">AI候補を仮反映して確認するか、承認前提の候補をまとめて作らせます</div>
       </div>
       <div class="form-field">
         <label class="field-label"><i class="bi bi-hash"></i> 定型ハッシュタグ</label>
@@ -315,6 +418,24 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
       <div class="form-field">
         <label class="field-label"><i class="bi bi-123"></i> 最大文字数（トークン）</label>
         <input type="number" id="f-maxtokens" class="field-input" value="300" min="50" max="2000" step="50" style="max-width:160px">
+      </div>
+      <div class="suggestion-box" id="style-suggestion-box">
+        <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start;flex-wrap:wrap;margin-bottom:.85rem">
+          <div>
+            <div style="font-size:.88rem;font-weight:700">AI候補</div>
+            <div id="style-suggestion-comment" class="field-hint" style="margin-top:.2rem">承認コメントを表示します。</div>
+          </div>
+          <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <button class="btn-secondary" type="button" onclick="applyStyleSuggestion()"><i class="bi bi-arrow-down-circle"></i> 入力欄へ反映</button>
+            <button class="btn-primary" type="button" onclick="approveStyleSuggestion()" style="padding:.6rem 1rem"><i class="bi bi-check2-circle"></i> 承認して保存</button>
+          </div>
+        </div>
+        <div class="suggestion-grid">
+          <div class="suggestion-card"><div class="suggestion-title">投稿テーマ</div><div class="suggestion-value" id="suggest-topic">-</div></div>
+          <div class="suggestion-card"><div class="suggestion-title">文体・トーン</div><div class="suggestion-value" id="suggest-style">-</div></div>
+          <div class="suggestion-card"><div class="suggestion-title">定型ハッシュタグ</div><div class="suggestion-value" id="suggest-hashtags">-</div></div>
+          <div class="suggestion-card"><div class="suggestion-title">AIシステムプロンプト</div><div class="suggestion-value" id="suggest-sysprompt">-</div></div>
+        </div>
       </div>
     </div>
   </div>
@@ -353,6 +474,8 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
 
 <script>
 'use strict';
+let styleSuggestionDraft = null;
+let apiKeyMasks = { openai: '', anthropic: '', gemini: '' };
 
 const PROVIDER_MODELS = {
   openai:    ['gpt-4o','gpt-4o-mini','gpt-4-turbo'],
@@ -367,6 +490,23 @@ const APIKEY_HINTS = {
 
 function esc(s){ return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function collectSettingsPayload() {
+  return {
+    ai_provider: document.getElementById('sel-provider').value,
+    ai_model: document.getElementById('sel-model').value,
+    ai_api_key: document.getElementById('sel-apikey').value,
+    ai_temperature: document.getElementById('sel-temp').value,
+    ai_system_prompt: document.getElementById('f-sysprompt').value,
+    ai_max_tokens: document.getElementById('f-maxtokens').value,
+    post_topic: document.getElementById('f-topic').value,
+    post_style: document.getElementById('f-style').value,
+    post_hashtags: document.getElementById('f-hashtags').value,
+    schedule_enabled: document.getElementById('f-sched-enabled').checked ? '1' : '0',
+    schedule_hours: document.getElementById('f-sched-hours').value,
+    schedule_days: document.getElementById('f-sched-days').value,
+  };
+}
+
 function selectProvider(p) {
   document.querySelectorAll('.provider-card').forEach(c=>c.classList.remove('selected'));
   document.getElementById('prov-'+p).classList.add('selected');
@@ -378,6 +518,8 @@ function selectProvider(p) {
   });
   document.getElementById('sel-model').value = PROVIDER_MODELS[p][0];
   document.getElementById('apikey-hint').innerHTML = APIKEY_HINTS[p];
+  const masked = apiKeyMasks[p] || '';
+  document.getElementById('apikey-stored').textContent = masked ? '保存済みキー: ' + masked : 'このAIの保存済みキーはまだありません';
   updateModelBadge();
 }
 
@@ -407,7 +549,7 @@ async function loadSettings() {
     if (s.post_hashtags)    document.getElementById('f-hashtags').value= s.post_hashtags;
     if (s.ai_system_prompt) document.getElementById('f-sysprompt').value= s.ai_system_prompt;
     if (s.ai_max_tokens)    document.getElementById('f-maxtokens').value= s.ai_max_tokens;
-    if (s.ai_api_key_masked) document.getElementById('apikey-stored').textContent = '保存済みキー: '+s.ai_api_key_masked;
+    apiKeyMasks = s.ai_api_key_masks || apiKeyMasks;
 
     const schedOn = s.schedule_enabled === '1';
     document.getElementById('f-sched-enabled').checked = schedOn;
@@ -415,34 +557,97 @@ async function loadSettings() {
     document.getElementById('sched-detail').style.display = schedOn ? '' : 'none';
     if (s.schedule_hours) document.getElementById('f-sched-hours').value = s.schedule_hours;
     if (s.schedule_days)  document.getElementById('f-sched-days').value  = s.schedule_days;
+    const currentProvider = s.ai_provider || document.getElementById('sel-provider').value;
+    const masked = apiKeyMasks[currentProvider] || '';
+    document.getElementById('apikey-stored').textContent = masked ? '保存済みキー: ' + masked : 'このAIの保存済みキーはまだありません';
     updateModelBadge();
   } catch(e){}
 }
 
 async function saveSettings() {
-  const payload = {
-    ai_provider:      document.getElementById('sel-provider').value,
-    ai_model:         document.getElementById('sel-model').value,
-    ai_api_key:       document.getElementById('sel-apikey').value,
-    ai_temperature:   document.getElementById('sel-temp').value,
-    ai_system_prompt: document.getElementById('f-sysprompt').value,
-    ai_max_tokens:    document.getElementById('f-maxtokens').value,
-    post_topic:       document.getElementById('f-topic').value,
-    post_style:       document.getElementById('f-style').value,
-    post_hashtags:    document.getElementById('f-hashtags').value,
-    schedule_enabled: document.getElementById('f-sched-enabled').checked ? '1' : '0',
-    schedule_hours:   document.getElementById('f-sched-hours').value,
-    schedule_days:    document.getElementById('f-sched-days').value,
-  };
+  const payload = collectSettingsPayload();
   try {
     const r = await fetch('./ai_settings.php?api=save', {method:'POST', headers:{'Content-Type':'application/json;charset=utf-8'}, body:JSON.stringify(payload)});
     const d = await r.json();
     toast(d.message, d.ok ? 'ok' : 'err');
     if (d.ok && payload.ai_api_key) {
+      apiKeyMasks[payload.ai_provider] = payload.ai_api_key.substring(0,6)+'*****';
       document.getElementById('sel-apikey').value = '';
-      document.getElementById('apikey-stored').textContent = '保存済みキー: '+payload.ai_api_key.substring(0,6)+'*****';
+      document.getElementById('apikey-stored').textContent = '保存済みキー: '+apiKeyMasks[payload.ai_provider];
     }
   } catch(e){ toast('保存失敗','err'); }
+}
+
+function renderStyleSuggestion(data) {
+  styleSuggestionDraft = data;
+  document.getElementById('style-suggestion-box').style.display = 'block';
+  document.getElementById('style-suggestion-comment').textContent = data.approval_comment || 'AIが保存候補を作成しました。';
+  document.getElementById('suggest-topic').textContent = data.post_topic || '未提案';
+  document.getElementById('suggest-style').textContent = data.post_style || '未提案';
+  document.getElementById('suggest-hashtags').textContent = data.post_hashtags || '未提案';
+  document.getElementById('suggest-sysprompt').textContent = data.ai_system_prompt || '未提案';
+}
+
+function applyStyleSuggestion() {
+  if (!styleSuggestionDraft) return;
+  document.getElementById('f-topic').value = styleSuggestionDraft.post_topic || document.getElementById('f-topic').value;
+  document.getElementById('f-style').value = styleSuggestionDraft.post_style || document.getElementById('f-style').value;
+  document.getElementById('f-hashtags').value = styleSuggestionDraft.post_hashtags || document.getElementById('f-hashtags').value;
+  document.getElementById('f-sysprompt').value = styleSuggestionDraft.ai_system_prompt || document.getElementById('f-sysprompt').value;
+  toast('AI候補を入力欄へ反映しました', 'ok');
+}
+
+async function approveStyleSuggestion() {
+  if (!styleSuggestionDraft) {
+    toast('先にAI候補を作成してください', 'err');
+    return;
+  }
+  const payload = { ...collectSettingsPayload(), ...styleSuggestionDraft };
+  try {
+    const r = await fetch('./ai_settings.php?api=approve_style', {method:'POST', headers:{'Content-Type':'application/json;charset=utf-8'}, body:JSON.stringify(payload)});
+    const d = await r.json();
+    toast(d.message, d.ok ? 'ok' : 'err');
+    if (d.ok) {
+      const currentApiKey = document.getElementById('sel-apikey').value;
+      const currentProvider = document.getElementById('sel-provider').value;
+      if (currentApiKey) {
+        apiKeyMasks[currentProvider] = currentApiKey.substring(0,6)+'*****';
+        document.getElementById('sel-apikey').value = '';
+        document.getElementById('apikey-stored').textContent = '保存済みキー: ' + apiKeyMasks[currentProvider];
+      }
+      applyStyleSuggestion();
+    }
+  } catch(e) {
+    toast('承認保存に失敗しました', 'err');
+  }
+}
+
+async function suggestStyle(autoApproveMode) {
+  const payload = {
+    provider: document.getElementById('sel-provider').value,
+    model: document.getElementById('sel-model').value,
+    api_key: document.getElementById('sel-apikey').value,
+    temperature: document.getElementById('sel-temp').value,
+    max_tokens: Number(document.getElementById('f-maxtokens').value || '300') + 200,
+    post_topic: document.getElementById('f-topic').value,
+    post_style: document.getElementById('f-style').value,
+    post_hashtags: document.getElementById('f-hashtags').value,
+    ai_system_prompt: document.getElementById('f-sysprompt').value,
+    mode: autoApproveMode ? 'approve' : 'preview',
+  };
+  try {
+    const r = await fetch('./ai_settings.php?api=suggest_style', {method:'POST', headers:{'Content-Type':'application/json;charset=utf-8'}, body:JSON.stringify(payload)});
+    const d = await r.json();
+    if (!d.ok) {
+      toast(d.message || 'AI候補の取得に失敗しました', 'err');
+      return;
+    }
+    renderStyleSuggestion(d.data);
+    applyStyleSuggestion();
+    toast(autoApproveMode ? 'AIがおまかせ候補を作成しました。内容を確認して承認できます。' : 'AI候補を作成しました。', 'ok');
+  } catch(e) {
+    toast('AI候補の取得に失敗しました', 'err');
+  }
 }
 
 async function testConnection() {

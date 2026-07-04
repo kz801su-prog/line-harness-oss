@@ -4,6 +4,7 @@ mb_internal_encoding('UTF-8');
 header('Content-Type: text/html; charset=utf-8');
 session_start();
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/lib/ai_post_assist.php';
 
 function db(): PDO {
     static $pdo = null;
@@ -22,6 +23,39 @@ function getSetting(string $key, string $default = ''): string {
     } catch(Exception $e){ return $default; }
 }
 
+/**
+ * Purpose: 投稿作成で選択中AIのAPIキーを取得し、AI設定の複数キー保存と同じ規約で解決する。
+ * Connected to: load_ai_post_config() と ai_settings.php の provider別保存。
+ */
+function get_provider_api_key_for_posts(string $provider): string {
+    $providerValue = getSetting(provider_api_setting_key($provider), '');
+    if ($providerValue !== '') {
+        return $providerValue;
+    }
+    return getSetting('ai_api_key', '');
+}
+
+/**
+ * Purpose: 投稿作成画面の通常生成とハンズフリー生成が同じ AI 設定を参照するための共通取得。
+ * Connected to: post_editor.php の generate / generate_handsfree API。
+ *
+ * @return array{provider:string,model:string,apiKey:string,sysprompt:string,topic:string,style:string,hashtags:string,maxTokens:int,temp:float}
+ */
+function load_ai_post_config(): array {
+    $provider = getSetting('ai_provider', 'openai');
+    return [
+        'provider' => $provider,
+        'model' => getSetting('ai_model', 'gpt-4o'),
+        'apiKey' => get_provider_api_key_for_posts($provider),
+        'sysprompt' => getSetting('ai_system_prompt', ''),
+        'topic' => getSetting('post_topic', ''),
+        'style' => getSetting('post_style', '親しみやすく、商品の魅力を伝える'),
+        'hashtags' => getSetting('post_hashtags', ''),
+        'maxTokens' => (int)getSetting('ai_max_tokens', '300'),
+        'temp' => (float)getSetting('ai_temperature', '0.7'),
+    ];
+}
+
 if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['login_pass'])) {
     if ($_POST['login_pass']===ADMIN_PASSWORD) $_SESSION['lh_auth']=true;
     else $login_error='パスワードが違います';
@@ -38,15 +72,16 @@ if ($auth && isset($_GET['api'])) {
         $raw      = json_decode(file_get_contents('php://input'), true) ?? [];
         $userHint = trim($raw['hint'] ?? '');
 
-        $provider  = getSetting('ai_provider',  'openai');
-        $model     = getSetting('ai_model',     'gpt-4o');
-        $apiKey    = getSetting('ai_api_key',   '');
-        $sysprompt = getSetting('ai_system_prompt', '');
-        $topic     = getSetting('post_topic',   '');
-        $style     = getSetting('post_style',   '親しみやすく、商品の魅力を伝える');
-        $hashtags  = getSetting('post_hashtags','');
-        $maxTokens = (int)getSetting('ai_max_tokens', '300');
-        $temp      = (float)getSetting('ai_temperature', '0.7');
+        $config = load_ai_post_config();
+        $provider = $config['provider'];
+        $model = $config['model'];
+        $apiKey = $config['apiKey'];
+        $sysprompt = $config['sysprompt'];
+        $topic = $config['topic'];
+        $style = $config['style'];
+        $hashtags = $config['hashtags'];
+        $maxTokens = $config['maxTokens'];
+        $temp = $config['temp'];
 
         if (!$apiKey) { echo json_encode(['ok'=>false,'message'=>'AIのAPIキーが未設定です。AI設定画面で設定してください。'],JSON_UNESCAPED_UNICODE); exit; }
 
@@ -62,6 +97,41 @@ if ($auth && isset($_GET['api'])) {
 
         $result = call_ai($provider, $model, $apiKey, $sysprompt, $userPrompt, $temp, $maxTokens);
         echo json_encode($result, JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    // AI が本文案と画像/動画の作成メモをまとめて返し、投稿作成画面へ自動反映する API。
+    if ($_GET['api']==='generate_handsfree' && $_SERVER['REQUEST_METHOD']==='POST') {
+        $raw = json_decode(file_get_contents('php://input'), true) ?? [];
+        $config = load_ai_post_config();
+        if ($config['apiKey'] === '') {
+            echo json_encode(['ok'=>false,'message'=>'AIのAPIキーが未設定です。AI設定画面で設定してください。'],JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $systemPrompt = $config['sysprompt'] !== ''
+            ? $config['sysprompt']
+            : "あなたはLINE投稿の編集長です。本文案と素材指示をJSONで返してください。";
+        $userPrompt = build_handsfree_post_prompt([
+            'hint' => $raw['hint'] ?? '',
+            'theme' => $config['topic'],
+            'style' => $config['style'],
+            'image_prompt' => trim((string)($raw['image_prompt'] ?? '')),
+            'video_prompt' => trim((string)($raw['video_prompt'] ?? '')),
+            'image_reference_urls' => preg_split('/\r\n|\r|\n/', (string)($raw['image_reference_text'] ?? '')) ?: [],
+            'video_reference_urls' => preg_split('/\r\n|\r|\n/', (string)($raw['video_reference_text'] ?? '')) ?: [],
+        ]);
+        if ($config['hashtags'] !== '') {
+            $userPrompt .= "\n本文末尾にこのハッシュタグを自然に使ってください: {$config['hashtags']}";
+        }
+
+        $result = call_ai($config['provider'], $config['model'], $config['apiKey'], $systemPrompt, $userPrompt, $config['temp'], max($config['maxTokens'], 600));
+        if (!$result['ok']) {
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $payload = normalize_handsfree_payload((string)$result['text']);
+        echo json_encode(['ok'=>true, 'data'=>$payload], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
@@ -201,6 +271,14 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
 /* Pattern chip */
 .pattern-chip{display:inline-flex;align-items:center;gap:4px;background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:.72rem;cursor:pointer;margin:2px;transition:.12s;color:var(--text2);}
 .pattern-chip:hover{border-color:var(--accent);color:var(--accent);}
+.ai-tab-row{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.85rem;}
+.ai-tab-btn{background:var(--surface3);border:1px solid var(--border);color:var(--text2);padding:.45rem .8rem;border-radius:999px;font-size:.76rem;cursor:pointer;transition:.15s;}
+.ai-tab-btn.active{background:rgba(124,58,237,.18);border-color:#7c3aed;color:#fff;}
+.ai-panel{display:none;}
+.ai-panel.active{display:block;}
+.assist-box{margin-top:.75rem;padding:.85rem;border:1px solid rgba(124,58,237,.35);border-radius:10px;background:rgba(124,58,237,.08);}
+.assist-list{margin:0;padding-left:1rem;color:var(--text2);font-size:.8rem;line-height:1.6;}
+.assist-list li{margin:.2rem 0;}
 /* Toast */
 .toast-wrap{position:fixed;bottom:1.5rem;right:1.5rem;z-index:9999;display:flex;flex-direction:column;gap:8px;}
 .toast-item{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:.8rem 1.2rem;font-size:.83rem;min-width:240px;max-width:360px;display:flex;align-items:center;gap:10px;box-shadow:0 8px 24px rgba(0,0,0,.5);animation:slideIn .25s ease;}
@@ -252,13 +330,56 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
           <span id="ai-model-label" style="font-size:.72rem;color:var(--text3)">読込中…</span>
         </div>
         <div class="card-body">
-          <div style="margin-bottom:.75rem">
-            <label class="field-label"><i class="bi bi-lightbulb"></i> 生成ヒント（省略可）</label>
-            <input type="text" id="ai-hint" class="hint-input" placeholder="例: 今週の新入荷のレザーバッグを紹介、夏のセール告知、会員限定クーポン案内">
+          <div class="ai-tab-row">
+            <button type="button" class="ai-tab-btn active" data-tab="text" onclick="switchAssistTab('text')">本文</button>
+            <button type="button" class="ai-tab-btn" data-tab="image" onclick="switchAssistTab('image')">AI画像</button>
+            <button type="button" class="ai-tab-btn" data-tab="video" onclick="switchAssistTab('video')">AI動画</button>
           </div>
-          <button class="btn-ai" id="btn-generate" onclick="generatePost()">
-            <i class="bi bi-stars"></i> AIで投稿文を生成
-          </button>
+
+          <div class="ai-panel active" data-panel="text">
+            <div style="margin-bottom:.75rem">
+              <label class="field-label"><i class="bi bi-lightbulb"></i> 生成ヒント（省略可）</label>
+              <input type="text" id="ai-hint" class="hint-input" placeholder="例: 今週の新入荷のレザーバッグを紹介、夏のセール告知、会員限定クーポン案内">
+            </div>
+          </div>
+
+          <div class="ai-panel" data-panel="image">
+            <div style="margin-bottom:.75rem">
+              <label class="field-label"><i class="bi bi-image"></i> 画像生成の指示</label>
+              <textarea id="image-prompt" class="post-textarea" style="min-height:120px;font-size:.82rem" placeholder="例: 商品を主役に、背景は上品で明るく、ブランドカラーを差し色に使う"></textarea>
+            </div>
+            <div style="margin-bottom:.75rem">
+              <label class="field-label"><i class="bi bi-link-45deg"></i> 画像の参考資料URL</label>
+              <textarea id="image-reference-text" class="post-textarea" style="min-height:100px;font-size:.82rem" placeholder="1行に1つずつ入力&#10;https://example.com/reference-image-1.jpg"></textarea>
+            </div>
+          </div>
+
+          <div class="ai-panel" data-panel="video">
+            <div style="margin-bottom:.75rem">
+              <label class="field-label"><i class="bi bi-camera-reels"></i> 動画生成の指示</label>
+              <textarea id="video-prompt" class="post-textarea" style="min-height:120px;font-size:.82rem" placeholder="例: 15秒、冒頭3秒で新作訴求、最後にCTAを入れる"></textarea>
+            </div>
+            <div style="margin-bottom:.75rem">
+              <label class="field-label"><i class="bi bi-link-45deg"></i> 動画の参考資料URL</label>
+              <textarea id="video-reference-text" class="post-textarea" style="min-height:100px;font-size:.82rem" placeholder="1行に1つずつ入力&#10;https://example.com/reference-video-1.mp4"></textarea>
+            </div>
+          </div>
+
+          <div style="margin-bottom:.75rem">
+            <label class="field-label"><i class="bi bi-check2-square"></i> 確認メモ</label>
+            <div class="assist-box">
+              <div id="assist-confirmation-empty" style="font-size:.78rem;color:var(--text3)">AIが本文と素材案を作ると、ここに確認項目が出ます。</div>
+              <ul id="assist-confirmation-list" class="assist-list" style="display:none"></ul>
+            </div>
+          </div>
+          <div style="display:grid;gap:.6rem">
+            <button class="btn-ai" id="btn-generate" onclick="generatePost()">
+              <i class="bi bi-stars"></i> AIで投稿文を生成
+            </button>
+            <button class="btn-ai" id="btn-handsfree" onclick="generateHandsfree()" style="background:linear-gradient(135deg,#2563eb,#7c3aed)">
+              <i class="bi bi-magic"></i> ハンズフリーで本文と素材案を作る
+            </button>
+          </div>
           <div id="gen-error" style="margin-top:.6rem;font-size:.78rem;color:var(--danger);display:none"></div>
         </div>
       </div>
@@ -332,6 +453,25 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI','Hiragino Kak
 'use strict';
 function esc(s){ return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function switchAssistTab(tabName){
+  document.querySelectorAll('.ai-tab-btn').forEach((el)=>el.classList.toggle('active', el.dataset.tab===tabName));
+  document.querySelectorAll('.ai-panel').forEach((el)=>el.classList.toggle('active', el.dataset.panel===tabName));
+}
+
+function renderConfirmationPoints(points){
+  const emptyEl = document.getElementById('assist-confirmation-empty');
+  const listEl = document.getElementById('assist-confirmation-list');
+  if(!points.length){
+    emptyEl.style.display = 'block';
+    listEl.style.display = 'none';
+    listEl.innerHTML = '';
+    return;
+  }
+  emptyEl.style.display = 'none';
+  listEl.style.display = 'block';
+  listEl.innerHTML = points.map((point)=>`<li>${esc(point)}</li>`).join('');
+}
+
 function updatePreview(){
   const text  = document.getElementById('post-body').value;
   const media = document.getElementById('post-media').value.trim();
@@ -356,7 +496,13 @@ function updateCharCount(){
   el.parentElement.className = n > 500 ? 'char-count char-over' : 'char-count';
 }
 
-function clearEditor(){ document.getElementById('post-body').value=''; document.getElementById('post-media').value=''; updatePreview(); updateCharCount(); }
+function clearEditor(){
+  document.getElementById('post-body').value='';
+  document.getElementById('post-media').value='';
+  renderConfirmationPoints([]);
+  updatePreview();
+  updateCharCount();
+}
 
 async function generatePost(){
   const btn = document.getElementById('btn-generate');
@@ -376,6 +522,59 @@ async function generatePost(){
     }
   } catch(e){ errEl.textContent='通信エラー'; errEl.style.display='block'; }
   btn.disabled=false; btn.innerHTML='<i class="bi bi-stars"></i> AIで投稿文を生成';
+}
+
+async function generateHandsfree(){
+  const btn = document.getElementById('btn-handsfree');
+  const errEl = document.getElementById('gen-error');
+  const payload = {
+    hint: document.getElementById('ai-hint').value.trim(),
+    image_prompt: document.getElementById('image-prompt').value.trim(),
+    video_prompt: document.getElementById('video-prompt').value.trim(),
+    image_reference_text: document.getElementById('image-reference-text').value,
+    video_reference_text: document.getElementById('video-reference-text').value,
+  };
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner">⟳</span> AIが準備中…';
+  errEl.style.display = 'none';
+  try {
+    const r = await fetch('./post_editor.php?api=generate_handsfree', {method:'POST',headers:{'Content-Type':'application/json;charset=utf-8'},body:JSON.stringify(payload)});
+    const d = await r.json();
+    if(!d.ok){
+      errEl.textContent = d.message || 'ハンズフリー生成に失敗しました';
+      errEl.style.display = 'block';
+      return;
+    }
+    const data = d.data || {};
+    if(data.post_text){
+      document.getElementById('post-body').value = data.post_text;
+    }
+    if(data.media_url){
+      document.getElementById('post-media').value = data.media_url;
+    }
+    if(data.image_prompt){
+      document.getElementById('image-prompt').value = data.image_prompt;
+    }
+    if(Array.isArray(data.image_reference_urls) && data.image_reference_urls.length){
+      document.getElementById('image-reference-text').value = data.image_reference_urls.join('\n');
+    }
+    if(data.video_prompt){
+      document.getElementById('video-prompt').value = data.video_prompt;
+    }
+    if(Array.isArray(data.video_reference_urls) && data.video_reference_urls.length){
+      document.getElementById('video-reference-text').value = data.video_reference_urls.join('\n');
+    }
+    renderConfirmationPoints(Array.isArray(data.confirmation_points) ? data.confirmation_points : []);
+    updatePreview();
+    updateCharCount();
+    toast('本文と素材案をハンズフリーで反映しました。最後に内容を確認してからキュー追加してください。', 'ok');
+  } catch(e) {
+    errEl.textContent = '通信エラー';
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-magic"></i> ハンズフリーで本文と素材案を作る';
+  }
 }
 
 async function queuePost(){
